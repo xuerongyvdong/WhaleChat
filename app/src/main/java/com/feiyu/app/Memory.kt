@@ -5,16 +5,17 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.sqrt
 
 /**
  * 多重记忆系统（Squire 2004 脑区分区 + Hebbian 1975/1995 权重更新）
  *
- * - 脑区标签：hippocampus（情景）/ neocortex（语义）/ flash（情绪闪光）
- * - 编码：候选池 → 判断，惊异度 surprise = 1 - max Jaccard
- * - 权重：w0 = w_base * (1 + surprise)，w_base = 40（主人来源）/ 15（其他）
- * - 存储：有向加权图，节点带 512 维语义向量
- * - 检索：图扩散激活 + 向量模式补全，按意图分配注意力预算
+ * 在基础图上增加了三层「像人」的机制：
+ * - 遗忘曲线：每条记忆有 stability（稳定度），召回随时间衰减
+ * - 再巩固：被想起一次就更牢一点，同时刷新「最后确认时间」
+ * - 睡眠巩固：定期把相似情景合并成一条语义记忆，原条目归档变模糊
+ * - 元记忆：每条记忆带来源与置信度，回答时可以「我记得你说过」或「我有点记不清」
  */
 data class MemNode(
     val id: String,
@@ -26,7 +27,21 @@ data class MemNode(
     val arousal: Float,
     val ts: Long,
     val source: String,
-    val vec: FloatArray
+    val vec: FloatArray,
+    /** 来源：user 主人说的 / inferred 我推断的 / mood 聊天氛围 */
+    val origin: String = if (source == "owner") "user" else "inferred",
+    /** 置信度 0~1 */
+    val confidence: Float = if (source == "owner") 0.8f else 0.55f,
+    /** 最后确认（被想起或再次被说起）的时间 */
+    val lastConfirm: Long = ts,
+    /** 稳定度，单位天，越大越难忘 */
+    val stability: Float = if (source == "owner") 5f else 3f,
+    /** 复习次数 */
+    val reviewCount: Int = 0,
+    /** 是否已归档（模糊层） */
+    val archived: Boolean = false,
+    /** 向量来源：hash 特征哈希 / bge-large-zh 本地模型 */
+    val engine: String = "hash"
 )
 
 data class MemEdge(val from: String, val to: String, val w: Float, val kind: String)
@@ -38,6 +53,9 @@ class MemoryStore(ctx: Context) {
         const val REGION_HIPPO = "hippocampus"
         const val REGION_NEO = "neocortex"
         const val REGION_FLASH = "flash"
+
+        /** 多久跑一次睡眠巩固 */
+        const val CONSOLIDATE_INTERVAL = 20 * 3600_000L
 
         private val POSITIVE = listOf(
             "开心", "高兴", "喜欢", "爱", "好棒", "厉害", "谢谢", "温暖", "幸福", "可爱",
@@ -86,12 +104,36 @@ class MemoryStore(ctx: Context) {
             for (x in a) if (x in b) inter++
             return inter.toFloat() / (a.size + b.size - inter).toFloat()
         }
+
+        /** 遗忘曲线：越久没被确认，保留率越低 */
+        fun retention(n: MemNode, now: Long): Float {
+            val days = ((now - n.lastConfirm).coerceAtLeast(0L)) / 86_400_000.0
+            val s = n.stability.coerceAtLeast(0.5f).toDouble()
+            return exp(-days / s).toFloat().coerceIn(0f, 1f)
+        }
+
+        fun confidenceLabel(c: Float): String = when {
+            c >= 0.75f -> "确定"
+            c >= 0.45f -> "较确定"
+            else -> "不太确定"
+        }
+
+        fun originLabel(o: String): String = when (o) {
+            "user" -> "主人说的"
+            "consolidated" -> "整理得出的"
+            "mood" -> "聊天氛围"
+            else -> "我猜的"
+        }
     }
 
     val nodes = LinkedHashMap<String, MemNode>()
     val edges = ArrayList<MemEdge>()
     private val file = File(ctx.filesDir, "memory_graph.json")
     private var lastId = 0L
+    private var lastConsolidate = 0L
+
+    /** 由 App 注入：接入本地语义模型后返回 1024 维向量 */
+    var localEmbed: ((String) -> FloatArray?)? = null
 
     init {
         load()
@@ -151,9 +193,37 @@ class MemoryStore(ctx: Context) {
             else -> REGION_NEO
         }
 
-        val id = "m" + (++lastId) + "_" + System.currentTimeMillis().toString(36)
-        val vec = vecOverride ?: embed(clean)
-        val node = MemNode(id, clean, region, w0, surprise, v, a, System.currentTimeMillis(), source, vec)
+        val now = System.currentTimeMillis()
+        val id = "m" + (++lastId) + "_" + now.toString(36)
+        val local = vecOverride ?: localEmbed?.invoke(clean)
+        val vec = local ?: embed(clean)
+        val engine = if (vec.size == LocalEmbedder.DIM) LocalEmbedder.ENGINE else "hash"
+
+        // 与已有记忆高度相似时，视为同一件事被再次确认：加固而不是新建
+        val twin = nodes.values.filter { cosine(vec, it.vec) >= 0.94f }.maxByOrNull { it.weight }
+        if (twin != null) {
+            val upd = twin.copy(
+                text = clean,
+                weight = (twin.weight + 6f).coerceAtMost(100f),
+                confidence = (twin.confidence + 0.08f).coerceAtMost(1f),
+                lastConfirm = now,
+                stability = (twin.stability * 1.6f).coerceAtMost(120f),
+                reviewCount = twin.reviewCount + 1,
+                archived = false
+            )
+            nodes[twin.id] = upd
+            save()
+            return upd
+        }
+
+        val node = MemNode(
+            id, clean, region, w0, surprise, v, a, now, source, vec,
+            origin = if (source == "owner") "user" else "inferred",
+            confidence = if (source == "owner") 0.8f else 0.55f,
+            lastConfirm = now,
+            stability = if (source == "owner") 5f else 3f,
+            engine = engine
+        )
         nodes[id] = node
 
         // 5) 建边：语义近邻 + 时间邻近
@@ -215,12 +285,21 @@ class MemoryStore(ctx: Context) {
 
     fun retrieve(query: String, topK: Int = 6, queryVec: FloatArray? = null): List<Pair<MemNode, Float>> {
         if (nodes.isEmpty() || (query.isBlank() && queryVec == null)) return emptyList()
-        val qv = queryVec ?: embed(query)
+        val qv = queryVec ?: localEmbed?.invoke(query) ?: embed(query)
         val intent = intentOf(query)
         val bud = budget(intent)
+        val now = System.currentTimeMillis()
 
         val cos = HashMap<String, Float>()
-        for (n in nodes.values) cos[n.id] = cosine(qv, n.vec)
+        val qTokens = tokens(query)
+        for (n in nodes.values) {
+            cos[n.id] = if (n.vec.size == qv.size) {
+                cosine(qv, n.vec)
+            } else {
+                // 新旧向量空间不同，改用词面重叠度
+                jaccard(qTokens, tokens(n.text)) * 0.9f
+            }
+        }
 
         // 图通道：从种子扩散激活
         val activation = HashMap<String, Float>()
@@ -237,21 +316,41 @@ class MemoryStore(ctx: Context) {
         val scored = nodes.values.map { n ->
             val c = cos[n.id] ?: 0f
             val act = activation[n.id] ?: 0f
-            val base = 0.5f * c + 0.3f * act + 0.2f * (n.weight / maxW)
+            // 遗忘曲线：越久没被确认，越难被想起
+            val keep = retention(n, now)
+            val effW = n.weight * (0.5f + 0.5f * keep) * (if (n.archived) 0.3f else 1f)
+            val base = 0.5f * c + 0.3f * act + 0.2f * (effW / maxW)
             val bonus = bud[n.region] ?: 0.2f
-            n to (base * (0.75f + 0.5f * bonus))
+            val confBonus = 0.85f + 0.3f * n.confidence
+            n to (base * (0.75f + 0.5f * bonus) * confBonus)
         }.filter { it.second > 0.12f }
             .sortedByDescending { it.second }
             .take(topK)
+
+        // 再巩固：被想起的记忆变牢，置信度略升
+        if (scored.isNotEmpty()) {
+            for ((n, _) in scored.take(3)) {
+                val upd = n.copy(
+                    lastConfirm = now,
+                    stability = (n.stability * 1.35f).coerceAtMost(180f),
+                    reviewCount = n.reviewCount + 1
+                )
+                nodes[n.id] = upd
+            }
+            save()
+        }
         return scored
     }
 
     fun formatForPrompt(hits: List<Pair<MemNode, Float>>): String {
         if (hits.isEmpty()) return ""
         val lines = hits.joinToString("\n") { (n, s) ->
-            "- [${regionLabel(n.region)}] ${n.text.take(80)}（强度${n.weight.toInt()}，相关${"%.2f".format(s)}）"
+            val tag = confidenceLabel(n.confidence)
+            val origin = originLabel(n.origin)
+            "- [${regionLabel(n.region)}|$origin|$tag] ${n.text.take(80)}（强度${n.weight.toInt()}）"
         }
-        return "【长期记忆·按脑区标注，供参考，不要逐字复述】\n$lines"
+        return "【长期记忆·按脑区标注，供参考，不要逐字复述】\n$lines\n" +
+            "只有标「确定」的可以当事实说；标「不太确定」的要用试探口气，例如「我有点记不清，你是不是说过…」。"
     }
 
     fun regionLabel(r: String): String = when (r) {
@@ -261,18 +360,134 @@ class MemoryStore(ctx: Context) {
         else -> r
     }
 
+    // ---------------- 睡眠巩固 ----------------
+
+    /**
+     * 整理一次记忆：
+     * 1) 相似情景合并成一条语义记忆
+     * 2) 长期没被确认的降权、归档为模糊层
+     * 返回 (合并条数, 归档条数)
+     */
+    fun consolidate(now: Long = System.currentTimeMillis()): Pair<Int, Int> {
+        if (nodes.isEmpty()) return 0 to 0
+
+        var merged = 0
+        val used = HashSet<String>()
+        val list = nodes.values.toList()
+        for (i in list.indices) {
+            val a = list[i]
+            if (a.id in used) continue
+            val group = ArrayList<MemNode>()
+            group.add(a)
+            for (j in i + 1 until list.size) {
+                val b = list[j]
+                if (b.id in used) continue
+                if (cosine(a.vec, b.vec) >= 0.72f) {
+                    group.add(b)
+                }
+            }
+            if (group.size < 3) continue
+
+            group.forEach { used.add(it.id) }
+            val newest = group.maxByOrNull { it.ts } ?: a
+            val summary = group.sortedByDescending { it.ts }
+                .map { it.text.trim().take(40) }
+                .distinct()
+                .take(3)
+                .joinToString("；")
+            val avgW = group.sumOf { it.weight.toDouble() }.toFloat() / group.size
+            val avgConf = group.sumOf { it.confidence.toDouble() }.toFloat() / group.size
+
+            val id = "m" + (++lastId) + "_c" + now.toString(36)
+            val vec = embed(summary)
+            val node = MemNode(
+                id = id,
+                text = summary,
+                region = REGION_NEO,
+                weight = (avgW * 1.2f).coerceAtMost(100f),
+                surprise = group.minOf { it.surprise },
+                valence = group.sumOf { it.valence.toDouble() }.toFloat() / group.size,
+                arousal = group.sumOf { it.arousal.toDouble() }.toFloat() / group.size,
+                ts = newest.ts,
+                source = "other",
+                vec = vec,
+                origin = "consolidated",
+                confidence = (avgConf * 0.95f).coerceIn(0f, 1f),
+                lastConfirm = now,
+                stability = 14f
+            )
+            nodes[id] = node
+
+            // 原条目归档，变模糊
+            for (n in group) {
+                nodes[n.id] = n.copy(archived = true, weight = (n.weight * 0.45f).coerceAtLeast(1f))
+            }
+            edges.add(MemEdge(id, newest.id, 0.6f, "abstraction"))
+            merged++
+        }
+
+        // 长期不用的记忆归档
+        var archived = 0
+        for ((id, n) in nodes.entries.toList()) {
+            if (n.archived) continue
+            val keep = retention(n, now)
+            val daysIdle = (now - n.lastConfirm) / 86_400_000.0
+            if (keep < 0.18f && daysIdle > 14) {
+                nodes[id] = n.copy(archived = true, weight = (n.weight * 0.6f).coerceAtLeast(1f))
+                archived++
+            }
+        }
+
+        lastConsolidate = now
+        save()
+        return merged to archived
+    }
+
+    /** 把向量空间不一致的旧记忆重新编码，返回处理条数 */
+    fun reembedAll(onProgress: (Int, Int) -> Unit = { _, _ -> }): Int {
+        val fn = localEmbed ?: return 0
+        val targets = nodes.values.filter { it.vec.size != LocalEmbedder.DIM }
+        if (targets.isEmpty()) return 0
+        var done = 0
+        for (n in targets) {
+            val v = runCatching { fn(n.text) }.getOrNull() ?: continue
+            nodes[n.id] = n.copy(vec = v, engine = LocalEmbedder.ENGINE)
+            done++
+            onProgress(done, targets.size)
+            if (done % 20 == 0) save()
+        }
+        if (done > 0) {
+            // 重建语义边
+            edges.removeAll { it.kind == "semantic" }
+            val list = nodes.values.toList()
+            for (i in list.indices) {
+                val a = list[i]
+                val near = list.drop(i + 1)
+                    .map { it to cosine(a.vec, it.vec) }
+                    .sortedByDescending { it.second }
+                    .take(2)
+                for ((b, sim) in near) {
+                    if (sim > 0.35f) {
+                        edges.add(MemEdge(a.id, b.id, sim, "semantic"))
+                        edges.add(MemEdge(b.id, a.id, sim * 0.8f, "semantic"))
+                    }
+                }
+            }
+        }
+        save()
+        return done
+    }
+
+    fun consolidateIfDue(now: Long = System.currentTimeMillis()): Pair<Int, Int> {
+        if (now - lastConsolidate < CONSOLIDATE_INTERVAL) return 0 to 0
+        return consolidate(now)
+    }
+
+    // ---------------- 持久化 ----------------
+
     fun exportJson(): JSONObject {
         val arr = JSONArray()
-        for (n in nodes.values) {
-            arr.put(
-                JSONObject()
-                    .put("id", n.id).put("text", n.text).put("region", n.region)
-                    .put("weight", n.weight).put("surprise", n.surprise)
-                    .put("valence", n.valence).put("arousal", n.arousal)
-                    .put("ts", n.ts).put("source", n.source)
-                    .put("vec", vecToString(n.vec))
-            )
-        }
+        for (n in nodes.values) arr.put(nodeToJson(n))
         val earr = JSONArray()
         for (e in edges) {
             earr.put(
@@ -280,26 +495,19 @@ class MemoryStore(ctx: Context) {
                     .put("w", e.w).put("kind", e.kind)
             )
         }
-        return JSONObject().put("nodes", arr).put("edges", earr).put("lastId", lastId)
+        return JSONObject().put("nodes", arr).put("edges", earr)
+            .put("lastId", lastId).put("lastConsolidate", lastConsolidate)
     }
 
     fun importJson(root: JSONObject) {
         nodes.clear()
         edges.clear()
         lastId = root.optLong("lastId", 0)
+        lastConsolidate = root.optLong("lastConsolidate", 0)
         val arr = root.optJSONArray("nodes") ?: JSONArray()
         for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            val id = o.getString("id")
-            nodes[id] = MemNode(
-                id, o.getString("text"), o.getString("region"),
-                o.optDouble("weight", 0.0).toFloat(),
-                o.optDouble("surprise", 0.0).toFloat(),
-                o.optDouble("valence", 0.0).toFloat(),
-                o.optDouble("arousal", 0.0).toFloat(),
-                o.optLong("ts", 0L), o.optString("source", "other"),
-                stringToVec(o.optString("vec", ""))
-            )
+            val n = nodeFromJson(arr.getJSONObject(i)) ?: continue
+            nodes[n.id] = n
         }
         val earr = root.optJSONArray("edges") ?: JSONArray()
         for (i in 0 until earr.length()) {
@@ -320,29 +528,9 @@ class MemoryStore(ctx: Context) {
         save()
     }
 
-    // ---------------- 持久化 ----------------
-
     fun save() {
         runCatching {
-            val arr = JSONArray()
-            for (n in nodes.values) {
-                val o = JSONObject()
-                    .put("id", n.id).put("text", n.text).put("region", n.region)
-                    .put("weight", n.weight).put("surprise", n.surprise)
-                    .put("valence", n.valence).put("arousal", n.arousal)
-                    .put("ts", n.ts).put("source", n.source)
-                    .put("vec", vecToString(n.vec))
-                arr.put(o)
-            }
-            val earr = JSONArray()
-            for (e in edges) {
-                earr.put(
-                    JSONObject().put("from", e.from).put("to", e.to)
-                        .put("w", e.w).put("kind", e.kind)
-                )
-            }
-            val root = JSONObject().put("nodes", arr).put("edges", earr).put("lastId", lastId)
-            file.writeText(root.toString())
+            file.writeText(exportJson().toString())
         }
     }
 
@@ -351,19 +539,11 @@ class MemoryStore(ctx: Context) {
             if (!file.exists()) return
             val root = JSONObject(file.readText())
             lastId = root.optLong("lastId", 0)
+            lastConsolidate = root.optLong("lastConsolidate", 0)
             val arr = root.optJSONArray("nodes") ?: JSONArray()
             for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val id = o.getString("id")
-                nodes[id] = MemNode(
-                    id, o.getString("text"), o.getString("region"),
-                    o.optDouble("weight", 0.0).toFloat(),
-                    o.optDouble("surprise", 0.0).toFloat(),
-                    o.optDouble("valence", 0.0).toFloat(),
-                    o.optDouble("arousal", 0.0).toFloat(),
-                    o.optLong("ts", 0L), o.optString("source", "other"),
-                    stringToVec(o.optString("vec", ""))
-                )
+                val n = nodeFromJson(arr.getJSONObject(i)) ?: continue
+                nodes[n.id] = n
             }
             val earr = root.optJSONArray("edges") ?: JSONArray()
             for (i in 0 until earr.length()) {
@@ -377,6 +557,40 @@ class MemoryStore(ctx: Context) {
             }
         }
     }
+
+    private fun nodeToJson(n: MemNode): JSONObject = JSONObject()
+        .put("id", n.id).put("text", n.text).put("region", n.region)
+        .put("weight", n.weight).put("surprise", n.surprise)
+        .put("valence", n.valence).put("arousal", n.arousal)
+        .put("ts", n.ts).put("source", n.source)
+        .put("origin", n.origin).put("confidence", n.confidence)
+        .put("lastConfirm", n.lastConfirm).put("stability", n.stability)
+        .put("reviewCount", n.reviewCount).put("archived", n.archived)
+        .put("engine", n.engine)
+        .put("vec", vecToString(n.vec))
+
+    private fun nodeFromJson(o: JSONObject): MemNode? = runCatching {
+        val ts = o.optLong("ts", 0L)
+        MemNode(
+            id = o.getString("id"),
+            text = o.getString("text"),
+            region = o.getString("region"),
+            weight = o.optDouble("weight", 0.0).toFloat(),
+            surprise = o.optDouble("surprise", 0.0).toFloat(),
+            valence = o.optDouble("valence", 0.0).toFloat(),
+            arousal = o.optDouble("arousal", 0.0).toFloat(),
+            ts = ts,
+            source = o.optString("source", "other"),
+            vec = stringToVec(o.optString("vec", "")),
+            origin = o.optString("origin", if (o.optString("source") == "owner") "user" else "inferred"),
+            confidence = o.optDouble("confidence", 0.6).toFloat(),
+            lastConfirm = o.optLong("lastConfirm", ts),
+            stability = o.optDouble("stability", 3.0).toFloat(),
+            reviewCount = o.optInt("reviewCount", 0),
+            archived = o.optBoolean("archived", false),
+            engine = o.optString("engine", if (o.optString("vec", "").count { it == ',' } > 700) LocalEmbedder.ENGINE else "hash")
+        )
+    }.getOrNull()
 
     private fun vecToString(v: FloatArray): String =
         v.joinToString(",") { ((it * 10000).toInt()).toString() }

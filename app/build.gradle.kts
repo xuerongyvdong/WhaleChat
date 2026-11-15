@@ -12,16 +12,28 @@ android {
         applicationId = "com.feiyu.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 135
-        versionName = "6.2.3"
+        versionCode = 142
+        versionName = "6.6.0"
+
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("D:/dp/dsh/_tools/fish.keystore")
+            storePassword = "fish123456"
+            keyAlias = "fish"
+            keyPassword = "fish123456"
+        }
     }
 
     buildFeatures { compose = true; buildConfig = true }
 
+    androidResources { noCompress += listOf("onnx") }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // 用本机自动生成的 debug 签名；正式发布请自行配置 release 签名
             signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
@@ -47,4 +59,5 @@ dependencies {
     implementation("androidx.compose.ui:ui:1.9.4")
     implementation("io.github.kyant0:backdrop:1.0.0")
     implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 }

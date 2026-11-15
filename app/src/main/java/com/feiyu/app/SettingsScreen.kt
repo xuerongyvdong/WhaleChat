@@ -78,6 +78,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import com.kyant.backdrop.backdrops.LayerBackdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
@@ -209,6 +210,30 @@ fun regionColor(region: String): Color = when (region) {
     else -> Color(0xFF5B6B85)
 }
 @Composable
+private fun ClearConfirmDialog(
+    title: String,
+    desc: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp))
+                .background(Color.White).padding(20.dp)
+        ) {
+            Txt(title, size = 16.sp, weight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            Txt(desc, size = 13.sp, color = Color(0xFF5B6B85))
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Box(Modifier.weight(1f)) { Chip("取消") { onDismiss() } }
+                Box(Modifier.weight(1f)) { Chip("确认清空", danger = true) { onConfirm() } }
+            }
+        }
+    }
+}
+
+@Composable
 fun ColumnScope.SettingsScreen(
     backdrop: LayerBackdrop,
     settings: Settings,
@@ -222,8 +247,11 @@ fun ColumnScope.SettingsScreen(
     onOpenAchievements: () -> Unit,
     onOpenRelation: () -> Unit,
     onClearChat: () -> Unit,
-    onClearFeed: () -> Unit
+    onClearFeed: () -> Unit,
+    onClearMemory: () -> Unit
 ) {
+    var pendingClear by remember { mutableStateOf<String?>(null) }
+
     Column(
         Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())
             .padding(start = 14.dp, end = 14.dp, top = 112.dp, bottom = 120.dp)
@@ -234,7 +262,7 @@ fun ColumnScope.SettingsScreen(
                 onChange(settings.copy(apiKey = it.trim()))
             }
             Txt(
-                "当前 Key 长度 ${settings.apiKey.trim().length}",
+                "当前 Key 长度 ${settings.apiKey.trim().length}（DeepSeek 官方一般 35 位，含 sk-）",
                 size = 11.sp, color = Color(0xFF8A96A8)
             )
             Spacer(Modifier.height(8.dp))
@@ -366,6 +394,42 @@ fun ColumnScope.SettingsScreen(
 
         Section(backdrop, settings, "主动") {
             val appCtx = LocalContext.current
+            SwitchRow("静默时段（不主动打扰）", settings.quietOn) {
+                onChange(settings.copy(quietOn = it))
+            }
+            if (settings.quietOn) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Txt("开始", size = 12.sp, color = Color(0xFF5B6B85))
+                    Spacer(Modifier.width(6.dp))
+                    Chip("-", danger = false) {
+                        onChange(settings.copy(quietStart = (settings.quietStart + 23) % 24))
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    Txt("%02d:00".format(settings.quietStart), size = 13.sp)
+                    Spacer(Modifier.width(4.dp))
+                    Chip("+", danger = false) {
+                        onChange(settings.copy(quietStart = (settings.quietStart + 1) % 24))
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Txt("结束", size = 12.sp, color = Color(0xFF5B6B85))
+                    Spacer(Modifier.width(6.dp))
+                    Chip("-", danger = false) {
+                        onChange(settings.copy(quietEnd = (settings.quietEnd + 23) % 24))
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    Txt("%02d:00".format(settings.quietEnd), size = 13.sp)
+                    Spacer(Modifier.width(4.dp))
+                    Chip("+", danger = false) {
+                        onChange(settings.copy(quietEnd = (settings.quietEnd + 1) % 24))
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Txt(
+                    "这段时间内她不会主动发消息，跨午夜也支持",
+                    size = 11.sp, color = Color(0xFF8A96A8)
+                )
+            }
+
             SwitchRow("主动找我聊天", settings.proactive) {
                 onChange(settings.copy(proactive = it))
                 if (it) Proactive.schedule(appCtx) else Proactive.cancel(appCtx)
@@ -437,11 +501,17 @@ fun ColumnScope.SettingsScreen(
             Spacer(Modifier.height(8.dp))
             Chip("打开记忆工作台") { onOpenMemory() }
             Spacer(Modifier.height(10.dp))
+            LocalModelRow()
+            Spacer(Modifier.height(10.dp))
             Txt("清空数据", size = 12.sp, color = Color(0xFF5B6B85))
             Spacer(Modifier.height(6.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Chip("清空聊天", danger = true) { onClearChat() }
-                Chip("清空动态", danger = true) { onClearFeed() }
+                Chip("清空聊天", danger = true) { pendingClear = "chat" }
+                Chip("清空动态", danger = true) { pendingClear = "feed" }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Chip("清空记忆库", danger = true) { pendingClear = "memory" }
             }
         }
 
@@ -457,6 +527,28 @@ fun ColumnScope.SettingsScreen(
             Chip("查看成就") { onOpenAchievements() }
         }
 
+        pendingClear?.let { what ->
+            val pair: Pair<String, String> = when (what) {
+                "chat" -> "清空全部聊天？" to "聊天记录会全部删除，且无法恢复。记忆和日记不受影响。"
+                "feed" -> "清空全部动态？" to "她发过的动态会全部删除，且无法恢复。"
+                else -> "清空记忆库？" to "她会忘掉记住的所有事情（脑区、权重、图谱），且无法恢复。聊天记录不受影响。"
+            }
+            val (title, desc) = pair
+            ClearConfirmDialog(
+                title = title,
+                desc = desc,
+                onDismiss = { pendingClear = null },
+                onConfirm = {
+                    when (what) {
+                        "chat" -> onClearChat()
+                        "feed" -> onClearFeed()
+                        else -> onClearMemory()
+                    }
+                    pendingClear = null
+                }
+            )
+        }
+
         Section(backdrop, settings, "关于") {
             Txt("WhaleChat", weight = FontWeight.SemiBold)
             Spacer(Modifier.height(4.dp))
@@ -464,7 +556,7 @@ fun ColumnScope.SettingsScreen(
             Spacer(Modifier.height(4.dp))
             Txt("开发者：雪绒于冬", size = 12.sp, color = Color(0xFF5B6B85))
             Spacer(Modifier.height(4.dp))
-            Txt("联系方式：见项目主页", size = 12.sp, color = Color(0xFF5B6B85))
+            Txt("联系方式：mahjonged85@gmail.com", size = 12.sp, color = Color(0xFF5B6B85))
             Spacer(Modifier.height(10.dp))
             Chip("更新日志") { onOpenLog() }
             Spacer(Modifier.height(6.dp))

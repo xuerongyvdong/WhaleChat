@@ -117,9 +117,7 @@ object Proactive {
             return null
         }
         if (now - lastActive < intervalMs) return null
-        // 晚上 1~7 点不打扰
-        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
-        if (hour in 1..7) return null
+        if (inQuietHours(settings)) return null
 
         val base = settings.optString("baseUrl", "").trim().trimEnd('/')
         val key = SecureKey.decrypt(ctx, settings.optString("apiKey", "")).trim()
@@ -159,6 +157,16 @@ object Proactive {
         }
         notify(ctx, clean)
         return clean
+    }
+
+    /** 静默时段：支持跨午夜，例如 23 → 7 */
+    fun inQuietHours(settings: JSONObject): Boolean {
+        if (!settings.optBoolean("quietOn", true)) return false
+        val start = settings.optInt("quietStart", 23).coerceIn(0, 23)
+        val end = settings.optInt("quietEnd", 7).coerceIn(0, 23)
+        if (start == end) return false
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        return if (start < end) hour in start until end else hour >= start || hour < end
     }
 
     private fun chat(ctx: Context, settings: JSONObject, prompt: String): String? = runCatching {

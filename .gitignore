@@ -23,3 +23,6 @@ captures/
 
 # 本地输出
 outputs/
+
+# 内置语义模型（体积过大，不入库）
+app/src/main/assets/models/

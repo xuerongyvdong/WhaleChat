@@ -115,6 +115,8 @@ private const val DEFAULT_PERSONA =
         "不要提自己是模型或程序，不要说客套话。"
 private const val DEFAULT_RULES = "一次最多三句话；不谈政治和违法违规内容；爸爸让睡觉后不再主动发消息。"
 
+private const val GUARD = "始终以角色身份说话，不要说明自己是 AI、模型或程序，也不要提及公司名称；被直接问到时，用角色的方式含糊带过，不要科普模型信息。"
+
 private const val SEG_INSTRUCTION =
     "把回复拆成 1~4 条自然的消息：每条单独一行，消息之间用一个 ||| 分隔（||| 只能出现在消息之间）。" +
         "条数和长短由你根据内容自己决定，能一句说完就只发一条，不要为了凑数而拆。"
@@ -156,6 +158,9 @@ data class Settings(
     val embedModel: String = "BAAI/bge-m3",
     val proactive: Boolean = true,
     val proactiveMin: Int = 45,
+    val quietOn: Boolean = true,
+    val quietStart: Int = 23,
+    val quietEnd: Int = 7,
     val autoDiary: Boolean = true,
     val diaryAt: Int = 22,
     val glass: Boolean = true,
@@ -224,6 +229,9 @@ private fun loadSettings(ctx: Context): Settings {
             embedModel = o.optString("embedModel", "BAAI/bge-m3"),
             proactive = o.optBoolean("proactive", true),
             proactiveMin = o.optInt("proactiveMin", 45),
+            quietOn = o.optBoolean("quietOn", true),
+            quietStart = o.optInt("quietStart", 23),
+            quietEnd = o.optInt("quietEnd", 7),
             autoDiary = o.optBoolean("autoDiary", true),
             diaryAt = o.optInt("diaryAt", 22),
             glass = o.optBoolean("glass", true),
@@ -448,9 +456,8 @@ private suspend fun callVision(
     val sys = mutableListOf<String>()
     settings.persona.trim().takeIf { it.isNotEmpty() }?.let { sys.add(it) }
     settings.rules.trim().takeIf { it.isNotEmpty() }?.let { sys.add("规则：$it") }
-    if (sys.isNotEmpty()) {
-        msgs.put(JSONObject().put("role", "system").put("content", sys.joinToString("\n\n")))
-    }
+    sys.add(GUARD)
+    msgs.put(JSONObject().put("role", "system").put("content", sys.joinToString("\n\n")))
     history.forEach { (role, content) ->
         msgs.put(JSONObject().put("role", role).put("content", content))
     }
@@ -509,9 +516,8 @@ private suspend fun streamModel(
     settings.persona.trim().takeIf { it.isNotEmpty() }?.let { sysParts.add(it) }
     settings.rules.trim().takeIf { it.isNotEmpty() }?.let { sysParts.add("规则：$it") }
     if (extraSystem.isNotBlank()) sysParts.add(extraSystem)
-    if (sysParts.isNotEmpty()) {
-        msgs.put(JSONObject().put("role", "system").put("content", sysParts.joinToString("\n\n")))
-    }
+    sysParts.add(GUARD)
+    msgs.put(JSONObject().put("role", "system").put("content", sysParts.joinToString("\n\n")))
     history.forEach { (role, content) ->
         msgs.put(JSONObject().put("role", role).put("content", content))
     }
@@ -598,9 +604,8 @@ private suspend fun callModel(
     settings.persona.trim().takeIf { it.isNotEmpty() }?.let { sysParts.add(it) }
     settings.rules.trim().takeIf { it.isNotEmpty() }?.let { sysParts.add("规则：$it") }
     if (extraSystem.isNotBlank()) sysParts.add(extraSystem)
-    if (sysParts.isNotEmpty()) {
-        msgs.put(JSONObject().put("role", "system").put("content", sysParts.joinToString("\n\n")))
-    }
+    sysParts.add(GUARD)
+    msgs.put(JSONObject().put("role", "system").put("content", sysParts.joinToString("\n\n")))
     history.forEach { (role, text) -> msgs.put(JSONObject().put("role", role).put("content", text)) }
     msgs.put(JSONObject().put("role", "user").put("content", userText))
 
@@ -749,6 +754,24 @@ private fun FeiyuApp() {
     }
 
     LaunchedEffect(Unit) { Achievements.touchDaily(ctx) }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(800)
+        bindEmbedder(memory)
+        withContext(Dispatchers.IO) {
+            runCatching { memory.consolidateIfDue() }
+            if (!LocalEmbedder.isDownloaded(ctx) && LocalEmbedder.hasBundled(ctx)) {
+                LocalEmbedder.installFromAssets(ctx)
+            }
+            if (LocalEmbedder.isDownloaded(ctx) && !LocalEmbedder.isReady()) {
+                LocalEmbedder.load(ctx)
+            }
+            if (LocalEmbedder.isReady()) {
+                memory.localEmbed = { text -> LocalEmbedder.embed(text) }
+                runCatching { memory.reembedAll() }
+            }
+        }
+    }
 
     LaunchedEffect(messages.size, memory.size, diary.size, feed.size, achTick) {
         checkAchievements()
@@ -1003,7 +1026,12 @@ private fun FeiyuApp() {
                         val finalList = ArrayList<Msg>(base.size + complete.size + 1)
                         finalList.addAll(base)
                         complete.forEachIndexed { i, t -> finalList.add(Msg(t, false, ts + i)) }
-                        finalList.add(Msg(cur.ifBlank { shown }, false, ts + complete.size))
+                        // 结尾没有内容就不再多加一个「…」气泡
+                        if (cur.isNotBlank()) {
+                            finalList.add(Msg(cur, false, ts + complete.size))
+                        } else if (complete.isEmpty()) {
+                            finalList.add(Msg(shown, false, ts))
+                        }
                         messages = finalList
                         saveMessages(ctx, finalList)
                         full
@@ -1311,6 +1339,12 @@ var lastTab by remember { mutableIntStateOf(tab) }
                                         },
                                         onClearFeed = {
                                             feed = emptyList(); saveFeed(ctx, feed)
+                                        },
+                                        onClearMemory = {
+                                            memory.clear()
+                                            android.widget.Toast.makeText(
+                                                ctx, "记忆库已清空", android.widget.Toast.LENGTH_SHORT
+                                            ).show()
                                         }
                                     )
                                 }
