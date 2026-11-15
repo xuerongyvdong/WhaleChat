@@ -2,7 +2,7 @@
 
 > 一个只属于你和一只鲸鱼娘的聊天软件。
 
-仓库：[github.com/MAHJOG-ED/WhaleChat](https://github.com/MAHJOG-ED/WhaleChat)　下载：[Releases](https://github.com/MAHJOG-ED/WhaleChat/releases)
+仓库：[github.com/xuerongyvdong/WhaleChat](https://github.com/xuerongyvdong/WhaleChat)　下载：[Releases](https://github.com/xuerongyvdong/WhaleChat/releases)
 
 WhaleChat 是一个原生 Android 应用：屏幕里住着一只蓝色鲸鱼娘「小鱼」，她记得你说过的话，会在你安静时先开口，会写日记、发动态，相处久了还会给你写一段故事。
 
