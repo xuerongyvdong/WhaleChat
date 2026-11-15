@@ -51,6 +51,16 @@ gradle assembleRelease
 
 想要她「看图」，需要在 设置 → 模型 → 看图配置 里填一个支持视觉的模型（例如智谱 `glm-4v-flash`）。
 
+## 内置语义模型（可选）
+
+Release 页面附带了本地语义模型 `bge-large-zh-v1.5`（ONNX int8，1024 维）：
+
+1. 从 [Releases](https://github.com/xuerongyvdong/WhaleChat/releases) 下载 `model_int8.onnx` 和 `vocab.txt`
+2. 放到 `app/src/main/assets/models/bge/` 目录下（文件名保持不变）
+3. 正常构建，APK 会自带模型（体积约 348MB）
+
+不放这两个文件也能构建，只是打包出来的版本默认使用轻量哈希向量，需要在设置里联网下载模型。
+
 ## 技术栈
 
 - Kotlin 2.2 + Jetpack Compose 1.9
