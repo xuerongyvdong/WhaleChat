@@ -1,6 +1,16 @@
 package com.feiyu.app
 
 import android.content.Context
+import androidx.compose.animation.core.animateFloat
+import kotlinx.coroutines.delay
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -134,7 +144,38 @@ fun RelationshipScreen(
     val todayXp = Relationship.todayXp(ctx)
     val (level, nextLevel, progress) = Relationship.levelProgress(intimacy)
     val days = remember { Relationship.recentDays(ctx, 30) }
-    var tick by remember { mutableIntStateOf(0) }
+    val streak = Relationship.streak(ctx)
+
+    // 入场：整页淡入 + 卡片依次上浮
+    var appeared by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        delay(60)
+        appeared = true
+    }
+
+    // 数值与进度条从 0 长出来
+    val barProgress by animateFloatAsState(
+        targetValue = if (appeared) progress else 0f,
+        animationSpec = tween(900, easing = FastOutSlowInEasing),
+        label = "relBar"
+    )
+    val ringProgress by animateFloatAsState(
+        targetValue = if (appeared) (todayXp.toFloat() / Relationship.DAILY_TARGET).coerceIn(0f, 1f) else 0f,
+        animationSpec = tween(1000, easing = FastOutSlowInEasing),
+        label = "relRing"
+    )
+
+    // 连续天数的小火苗呼吸
+    val breathe = rememberInfiniteTransition(label = "streak")
+    val flameScale by breathe.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.08f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1600, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "flame"
+    )
 
     Column(
         Modifier.fillMaxSize()
@@ -160,9 +201,12 @@ fun RelationshipScreen(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState())
                 .padding(horizontal = 14.dp, vertical = 4.dp)
         ) {
-            // 亲密度
+            // ---------- 亲密度 ----------
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
+                Modifier.fillMaxWidth()
+                    .alpha(if (appeared) 1f else 0f)
+                    .graphicsLayer { translationY = if (appeared) 0f else 18f }
+                    .clip(RoundedCornerShape(18.dp))
                     .background(Color.White).padding(16.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -171,7 +215,12 @@ fun RelationshipScreen(
                     Txt("Lv. $level", size = 12.sp, color = Ui.AccentDeep)
                 }
                 Spacer(Modifier.height(10.dp))
-                Txt("$intimacy", size = 34.sp, weight = FontWeight.Light, color = Color(0xFF16202C))
+                RollingNumber(
+                    value = intimacy,
+                    size = 34.sp,
+                    weight = FontWeight.Light,
+                    color = Color(0xFF16202C)
+                )
                 Spacer(Modifier.height(2.dp))
                 Txt(
                     if (nextLevel == "满级") "已经走到最后一格了"
@@ -185,7 +234,7 @@ fun RelationshipScreen(
                         .background(Color(0xFFE9EDF2))
                 ) {
                     Box(
-                        Modifier.fillMaxWidth(progress).height(6.dp)
+                        Modifier.fillMaxWidth(barProgress).height(6.dp)
                             .clip(RoundedCornerShape(3.dp))
                             .background(Ui.Accent)
                     )
@@ -194,10 +243,13 @@ fun RelationshipScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            // 今日活跃 + 连续天数
+            // ---------- 今日活跃 + 连续天数 ----------
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Column(
-                    Modifier.weight(1f).clip(RoundedCornerShape(18.dp))
+                    Modifier.weight(1f)
+                        .alpha(if (appeared) 1f else 0f)
+                        .graphicsLayer { translationY = if (appeared) 0f else 24f }
+                        .clip(RoundedCornerShape(18.dp))
                         .background(Color.White).padding(16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
@@ -215,7 +267,7 @@ fun RelationshipScreen(
                             drawArc(
                                 color = Ui.Accent,
                                 startAngle = -90f,
-                                sweepAngle = 360f * min(1f, todayXp.toFloat() / Relationship.DAILY_TARGET),
+                                sweepAngle = 360f * ringProgress,
                                 useCenter = false,
                                 topLeft = androidx.compose.ui.geometry.Offset(stroke / 2, stroke / 2),
                                 size = arcSize,
@@ -223,7 +275,7 @@ fun RelationshipScreen(
                             )
                         }
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Txt("$todayXp", size = 20.sp, weight = FontWeight.Medium)
+                            RollingNumber(value = todayXp, size = 20.sp, weight = FontWeight.Medium)
                             Txt("/ ${Relationship.DAILY_TARGET}", size = 9.sp, color = Color(0xFF8A96A8))
                         }
                     }
@@ -232,14 +284,23 @@ fun RelationshipScreen(
                 }
 
                 Column(
-                    Modifier.weight(1f).clip(RoundedCornerShape(18.dp))
+                    Modifier.weight(1f)
+                        .alpha(if (appeared) 1f else 0f)
+                        .graphicsLayer { translationY = if (appeared) 0f else 24f }
+                        .clip(RoundedCornerShape(18.dp))
                         .background(Color.White).padding(16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Spacer(Modifier.height(8.dp))
-                    Txt("🔥", size = 34.sp)
+                    Txt(
+                        "🔥", size = 34.sp,
+                        modifier = Modifier.graphicsLayer {
+                            scaleX = flameScale
+                            scaleY = flameScale
+                        }
+                    )
                     Spacer(Modifier.height(6.dp))
-                    Txt("连续 ${Relationship.streak(ctx)} 天", size = 14.sp, weight = FontWeight.Medium)
+                    Txt("连续 $streak 天", size = 14.sp, weight = FontWeight.Medium)
                     Spacer(Modifier.height(4.dp))
                     Txt("每天都在", size = 10.sp, color = Color(0xFF8A96A8))
                 }
@@ -247,21 +308,37 @@ fun RelationshipScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            // 最近 30 天热力图
+            // ---------- 30 天热力图（逐格出现） ----------
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp))
+                Modifier.fillMaxWidth()
+                    .alpha(if (appeared) 1f else 0f)
+                    .graphicsLayer { translationY = if (appeared) 0f else 24f }
+                    .clip(RoundedCornerShape(18.dp))
                     .background(Color.White).padding(16.dp)
             ) {
                 Txt("最近 30 天", size = 13.sp, weight = FontWeight.SemiBold)
                 Spacer(Modifier.height(10.dp))
                 val maxCount = days.maxOfOrNull { it.second }?.coerceAtLeast(1) ?: 1
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    days.chunked(10).forEach { row ->
+                    days.chunked(10).forEachIndexed { rowIndex, row ->
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            row.forEach { (_, count) ->
-                                val alpha = if (count == 0) 0.06f else 0.25f + 0.75f * (count.toFloat() / maxCount)
+                            row.forEachIndexed { colIndex, item ->
+                                val count = item.second
+                                val alpha = if (count == 0) 0.06f
+                                else 0.25f + 0.75f * (count.toFloat() / maxCount)
+                                var cellShown by remember { mutableStateOf(false) }
+                                LaunchedEffect(Unit) {
+                                    delay(180L + (rowIndex * 10 + colIndex) * 12L)
+                                    cellShown = true
+                                }
                                 Box(
                                     Modifier.weight(1f).height(16.dp)
+                                        .graphicsLayer {
+                                            val p = if (cellShown) 1f else 0.4f
+                                            scaleX = p
+                                            scaleY = p
+                                            this.alpha = if (cellShown) 1f else 0f
+                                        }
                                         .clip(RoundedCornerShape(4.dp))
                                         .background(Ui.Accent.copy(alpha = alpha))
                                 )
@@ -274,6 +351,7 @@ fun RelationshipScreen(
 
             Spacer(Modifier.height(12.dp))
 
+            // ---------- 底部统计 ----------
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 listOf(
                     "消息" to messages,
@@ -281,11 +359,13 @@ fun RelationshipScreen(
                     "记忆" to memories
                 ).forEach { (label, value) ->
                     Column(
-                        Modifier.weight(1f).clip(RoundedCornerShape(16.dp))
+                        Modifier.weight(1f)
+                            .alpha(if (appeared) 1f else 0f)
+                            .clip(RoundedCornerShape(16.dp))
                             .background(Color.White).padding(14.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Txt("$value", size = 18.sp, weight = FontWeight.Medium)
+                        RollingNumber(value = value, size = 18.sp, weight = FontWeight.Medium)
                         Spacer(Modifier.height(2.dp))
                         Txt(label, size = 10.sp, color = Color(0xFF8A96A8))
                     }

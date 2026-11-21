@@ -10,6 +10,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -18,6 +20,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -26,12 +31,14 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kyant.backdrop.backdrops.LayerBackdrop
+import kotlinx.coroutines.delay
 import java.io.File
 
 val EMOJIS = listOf(
@@ -53,10 +60,13 @@ fun ColumnScope.ChatScreen(
     listState: LazyListState,
     busy: Boolean,
     error: String,
+    streamingText: String = "",
     onSend: (String) -> Unit,
     onSendImage: (String) -> Unit
 ) {
     var showEmoji by remember { mutableStateOf(false) }
+    var sent by remember { mutableStateOf(false) }
+    val sendScope = rememberCoroutineScope()
     var input by remember { mutableStateOf("") }
     val haptic = LocalHapticFeedback.current
     val ctx = LocalContext.current
@@ -74,16 +84,74 @@ fun ColumnScope.ChatScreen(
         }
     }
 
+    val density = LocalDensity.current
+    val imeInsets = WindowInsets.ime
+    var imeVisible by remember { mutableStateOf(false) }
+
+    // 键盘弹出时把最后一条消息滚到输入框上方，避免被遮挡
+    LaunchedEffect(Unit) {
+        snapshotFlow { imeInsets.getBottom(density) > 0 }
+            .collect { visible ->
+                imeVisible = visible
+                if (visible) {
+                    delay(240)
+                    if (messages.isNotEmpty()) {
+                        listState.animateScrollToItem(messages.lastIndex)
+                    }
+                }
+            }
+    }
+
+    // 新消息到达时，如果键盘正开着，也跟着滚
+    LaunchedEffect(messages.size, imeVisible) {
+        if (imeVisible && messages.isNotEmpty()) {
+            delay(120)
+            listState.animateScrollToItem(messages.lastIndex)
+        }
+    }
+
+    // 发送后滚到新消息
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) {
+            delay(60)
+            runCatching { listState.animateScrollToItem(messages.lastIndex) }
+        }
+    }
+
+    // 键盘弹起：把最后一条消息顶到输入框上方
+    LaunchedEffect(imeVisible) {
+        if (imeVisible && messages.isNotEmpty()) {
+            delay(260)
+            runCatching { listState.animateScrollToItem(messages.lastIndex) }
+        }
+    }
+
+    // 流式时保持贴底
+    LaunchedEffect(streamingText.isNotBlank()) {
+        if (streamingText.isNotBlank()) {
+            delay(120)
+            runCatching { listState.animateScrollToItem(messages.size) }
+        }
+    }
+
     Box(Modifier.weight(1f).fillMaxWidth()) {
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
-                start = 14.dp, end = 14.dp, top = 112.dp, bottom = 210.dp
+                start = 14.dp, end = 14.dp, top = 112.dp,
+                bottom = if (imeVisible) 172.dp else 210.dp
             )
         ) {
             items(messages.size, key = { messages[it].ts }) { i ->
                 MessageRow(backdrop, settings, messages[i])
+            }
+
+            // 正在增长的那一条：独立 key，只让它自己重组
+            if (streamingText.isNotBlank()) {
+                item(key = "streaming_bubble") {
+                    MessageRow(backdrop, settings, Msg(streamingText, false, 0L))
+                }
             }
 
             if (messages.isEmpty()) {
@@ -108,7 +176,8 @@ fun ColumnScope.ChatScreen(
         }
 
         Column(
-            Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(bottom = 96.dp)
+            Modifier.fillMaxWidth().align(Alignment.BottomCenter)
+                .padding(bottom = 96.dp)
         ) {
             if (error.isNotEmpty()) {
                 Txt(
@@ -190,10 +259,26 @@ fun ColumnScope.ChatScreen(
                             animationSpec = androidx.compose.animation.core.tween(90),
                             label = "sendScale"
                         )
+                        val hasText = input.isNotBlank()
+                        val sendBg by androidx.compose.animation.animateColorAsState(
+                            targetValue = when {
+                                sent -> Color(0xFFDCEBFF)
+                                !hasText -> Color(0xFFE3E8F0)
+                                else -> Color(0xFF4C9DF8).copy(alpha = 0.95f)
+                            },
+                            animationSpec = androidx.compose.animation.core.tween(220),
+                            label = "sendBg"
+                        )
+                        val arrowAlpha by androidx.compose.animation.core.animateFloatAsState(
+                            targetValue = if (sent) 0f else 1f,
+                            animationSpec = androidx.compose.animation.core.tween(140),
+                            label = "sendArrow"
+                        )
+
                         Box(
                             Modifier.size(42.dp).clip(CircleShape)
                                 .graphicsLayer { scaleX = sendScale; scaleY = sendScale }
-                                .background(Color(0xFF4C9DF8).copy(alpha = 0.92f))
+                                .background(sendBg)
                                 .clickable(
                                     interactionSource = sendInteraction,
                                     indication = null
@@ -205,11 +290,46 @@ fun ColumnScope.ChatScreen(
                                         onSend(input)
                                         input = ""
                                         showEmoji = false
+                                        sent = true
+                                        sendScope.launch {
+                                            kotlinx.coroutines.delay(1500)
+                                            sent = false
+                                        }
                                     }
                                 },
                             contentAlignment = Alignment.Center
                         ) {
-                            Txt("↑", size = 19.sp, weight = FontWeight.Bold, color = Color.White)
+                            Txt(
+                                "↑", size = 19.sp, weight = FontWeight.Bold,
+                                color = if (hasText) Color.White else Color(0xFF9AA6B6),
+                                modifier = Modifier.graphicsLayer {
+                                    alpha = arrowAlpha
+                                    translationY = if (sent) -4f else 0f
+                                }
+                            )
+                            DrawCheck(
+                                visible = sent,
+                                color = Ui.AccentDeep,
+                                size = 20.dp
+                            )
+                            if (sent) {
+                                val halo = remember { androidx.compose.animation.core.Animatable(0f) }
+                                LaunchedEffect(sent) {
+                                    if (sent) {
+                                        halo.snapTo(0f)
+                                        halo.animateTo(1f, androidx.compose.animation.core.tween(520))
+                                    }
+                                }
+                                Box(
+                                    Modifier.size(42.dp).graphicsLayer {
+                                        val p = halo.value
+                                        scaleX = 1f + p * 0.7f
+                                        scaleY = 1f + p * 0.7f
+                                        alpha = (1f - p) * 0.45f
+                                    }.clip(CircleShape)
+                                        .background(Ui.Accent.copy(alpha = 0.5f))
+                                )
+                            }
                         }
                     }
                 }

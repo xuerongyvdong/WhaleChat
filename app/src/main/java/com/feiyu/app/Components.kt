@@ -42,6 +42,11 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -219,19 +224,50 @@ fun Modifier.animateIn(key: Any): Modifier {
 
 @Composable
 fun Modifier.springPress(onClick: () -> Unit): Modifier {
-    val src = remember { MutableInteractionSource() }
-    val pressed by src.collectIsPressedAsState()
-    val sc by animateFloatAsState(
-        targetValue = if (pressed) 0.94f else 1f,
-        animationSpec = spring(dampingRatio = 0.34f, stiffness = 720f),
-        label = "springPress"
-    )
     val haptic = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
+    val scale = remember { Animatable(1f) }
+    val ripple = remember { Animatable(0f) }
+    var point by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    var box by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
+
     return this
-        .graphicsLayer { scaleX = sc; scaleY = sc }
-        .clickable(interactionSource = src, indication = null) {
-            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-            onClick()
+        .onSizeChanged { box = it }
+        .graphicsLayer {
+            scaleX = scale.value
+            scaleY = scale.value
+        }
+        .drawWithContent {
+            drawContent()
+            // 涟漪从触点散开
+            val r = ripple.value
+            if (r > 0.01f && r < 1f) {
+                drawCircle(
+                    color = Color.White.copy(alpha = 0.42f * (1f - r)),
+                    radius = maxOf(box.width, box.height) * 0.95f * r,
+                    center = point
+                )
+            }
+        }
+        .pointerInput(Unit) {
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false)
+                point = down.position
+                // 按压：先压过头（0.955）
+                scope.launch { scale.animateTo(0.955f, spring(dampingRatio = 0.42f, stiffness = 900f)) }
+                scope.launch { ripple.snapTo(0.35f) }
+                scope.launch { ripple.animateTo(1f, tween(360, easing = LinearOutSlowInEasing)) }
+                val up = waitForUpOrCancellation()
+                // 松手：冲过 1.02 再落回 1（压过头再回弹）
+                scope.launch {
+                    scale.animateTo(1.022f, spring(dampingRatio = 0.52f, stiffness = 520f))
+                    scale.animateTo(1f, spring(dampingRatio = 0.3f, stiffness = 280f))
+                }
+                if (up != null) {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onClick()
+                }
+            }
         }
 }
 
@@ -358,6 +394,126 @@ fun Section(
     Spacer(Modifier.height(14.dp))
 }
 
+/**
+ * 带保持键的输入框：改完点右侧按钮才写入，并播放三连变（收缩→转圈→对勾）。
+ */
+/**
+ * 多行保持键输入：内容改完点右下角按钮才写入，三连变反馈。
+ */
+@Composable
+fun CommitFieldMulti(
+    label: String,
+    value: String,
+    lines: Int = 4,
+    hint: String = "",
+    onCommit: (String) -> Boolean
+) {
+    var draft by remember(value) { mutableStateOf(value) }
+    val dirty = draft.trim() != value.trim()
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Txt(label, size = 12.sp, color = Color(0xFF5B6B85))
+        Spacer(Modifier.weight(1f))
+        if (dirty) {
+            Txt("未保存", size = 10.sp, color = Color(0xFFE08A3C))
+        } else {
+            Txt("已同步", size = 10.sp, color = Color(0xFF9AA6B6))
+        }
+    }
+    Spacer(Modifier.height(6.dp))
+    Box(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.White.copy(alpha = 0.66f))
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        BasicTextField(
+            value = draft,
+            onValueChange = { draft = it },
+            textStyle = androidx.compose.ui.text.TextStyle(
+                fontSize = 14.sp,
+                color = Color(0xFF16202C),
+                lineHeight = 20.sp
+            ),
+            minLines = lines,
+            maxLines = lines + 4,
+            modifier = Modifier.fillMaxWidth()
+        )
+        if (draft.isEmpty() && hint.isNotEmpty()) {
+            Txt(hint, size = 13.sp, color = Color(0xFFB0BAC9))
+        }
+    }
+    Spacer(Modifier.height(8.dp))
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        HoldButton(
+            label = if (dirty) "保存" else "已保存",
+            expandedWidth = 84.dp,
+            height = 40.dp
+        ) {
+            if (dirty) onCommit(draft.trim()) else true
+        }
+    }
+    Spacer(Modifier.height(6.dp))
+}
+
+@Composable
+fun CommitField(
+    label: String,
+    value: String,
+    password: Boolean = false,
+    hint: String = "",
+    onCommit: (String) -> Boolean
+) {
+    var draft by remember(value) { mutableStateOf(value) }
+    var shown by remember { mutableStateOf(false) }
+
+    Txt(label, size = 12.sp, color = Color(0xFF5B6B85))
+    Spacer(Modifier.height(6.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier.weight(1f).height(46.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.White.copy(alpha = 0.66f))
+                .padding(horizontal = 12.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            BasicTextField(
+                value = draft,
+                onValueChange = { draft = it },
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    fontSize = 15.sp,
+                    color = Color(0xFF16202C)
+                ),
+                visualTransformation = if (password && !shown)
+                    androidx.compose.ui.text.input.PasswordVisualTransformation()
+                else androidx.compose.ui.text.input.VisualTransformation.None,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (draft.isEmpty() && hint.isNotEmpty()) {
+                Txt(hint, size = 13.sp, color = Color(0xFFB0BAC9))
+            }
+        }
+        if (password) {
+            Spacer(Modifier.width(6.dp))
+            Txt(
+                if (shown) "隐藏" else "显示",
+                size = 11.sp, color = Ui.AccentDeep,
+                modifier = Modifier.tap { shown = !shown }
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        HoldButton(
+            label = if (draft.trim() == value.trim()) "已保存" else "保存",
+            expandedWidth = 84.dp,
+            height = 40.dp
+        ) {
+            if (draft.isBlank()) false else onCommit(draft)
+        }
+    }
+    Spacer(Modifier.height(10.dp))
+}
+
 @Composable
 fun Field(
     label: String,
@@ -423,16 +579,7 @@ fun Field(
 fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Txt(label, size = 14.sp, modifier = Modifier.weight(1f))
-        Box(
-            Modifier.width(44.dp).height(26.dp).clip(RoundedCornerShape(13.dp))
-                .background(if (checked) Color(0xFF4C9DF8) else Color(0xFFD6DAE2))
-                .tap { onChange(!checked) }
-        ) {
-            Box(
-                Modifier.padding(top = 3.dp, start = if (checked) 21.dp else 3.dp)
-                    .size(20.dp).clip(CircleShape).background(Color.White)
-            )
-        }
+        SpringSwitch(checked = checked, onChange = onChange)
     }
 }
 
@@ -463,6 +610,15 @@ fun ColumnScope.FloatingTabBar(
     onSelect: (Int) -> Unit
 ) {
     val labels = listOf("聊天", "动态", "日记", "设置")
+    val haptic = LocalHapticFeedback.current
+    var preview by remember { mutableIntStateOf(-1) }
+    var tabSwipe by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(preview) {
+        if (preview >= 0) {
+            delay(1400)
+            preview = -1
+        }
+    }
     Box(
         Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp)
     ) {
@@ -487,7 +643,6 @@ fun ColumnScope.FloatingTabBar(
                         offset.snapTo(target)
                         inited = true
                     } else {
-                        // 果冻：低阻尼弹簧，会轻微过冲再回弹
                         offset.animateTo(
                             targetValue = target,
                             animationSpec = spring(dampingRatio = 0.38f, stiffness = 220f)
@@ -519,7 +674,22 @@ fun ColumnScope.FloatingTabBar(
                             Modifier
                                 .weight(1f)
                                 .fillMaxHeight()
-                                .tap { onSelect(i) },
+                                .combinedClickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                    onClick = {
+                                        haptic.performHapticFeedback(
+                                            androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove
+                                        )
+                                        onSelect(i)
+                                    },
+                                    onLongClick = {
+                                        haptic.performHapticFeedback(
+                                            androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress
+                                        )
+                                        preview = i
+                                    }
+                                ),
                             contentAlignment = Alignment.Center
                         ) {
                             Column(
@@ -537,6 +707,35 @@ fun ColumnScope.FloatingTabBar(
                                     color = if (active) Ui.AccentDeep else Color(0xFF3A3A3A)
                                 )
                             }
+                        }
+                    }
+                }
+
+                // 长按预览气泡
+                if (preview in labels.indices) {
+                    val px = with(density) { (slot * preview).toPx() }
+                    val widthPx = with(density) { slot.toPx() }
+                    val bubbleW = with(density) { 104.dp.toPx() }
+                    Box(
+                        Modifier
+                            .offset {
+                                androidx.compose.ui.unit.IntOffset(
+                                    (px + widthPx / 2 - bubbleW / 2).toInt(),
+                                    with(density) { (-52).dp.toPx() }.toInt()
+                                )
+                            }
+                            .width(104.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xFF16202C).copy(alpha = 0.88f))
+                            .padding(vertical = 7.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Txt(labels[preview], size = 12.sp, color = Color.White)
+                            Txt(
+                                listOf("和她说说话", "她最近的心情", "她写下的字", "调教与备份")[preview],
+                                size = 9.sp, color = Color.White.copy(alpha = 0.72f)
+                            )
                         }
                     }
                 }

@@ -106,6 +106,38 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 @Composable
+private fun MemoryCard(memory: MemoryStore, n: MemNode, score: Float) {
+    Column(
+        Modifier.fillMaxWidth().padding(bottom = 10.dp)
+            .clip(RoundedCornerShape(Ui.ChipRadius))
+            .background(Color.White)
+            .padding(12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.clip(RoundedCornerShape(6.dp))
+                    .background(regionColor(n.region).copy(alpha = 0.15f))
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) {
+                Txt(memory.regionLabel(n.region), size = 10.sp, color = regionColor(n.region))
+            }
+            Spacer(Modifier.width(8.dp))
+            Txt("强度 ${n.weight.toInt()}", size = 10.sp, color = Color(0xFF5B6B85))
+            Spacer(Modifier.width(8.dp))
+            Txt(MemoryStore.confidenceLabel(n.confidence), size = 10.sp, color = Color(0xFF5B6B85))
+            Spacer(Modifier.weight(1f))
+            if (n.archived) {
+                Txt("模糊了", size = 10.sp, color = Color(0xFFB0BAC9))
+            } else {
+                Txt("相关 ${"%.2f".format(score)}", size = 10.sp, color = Color(0xFF8A96A8))
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Txt(n.text, size = 14.sp)
+    }
+}
+
+@Composable
 fun MemoryScreen(memory: MemoryStore, onClose: () -> Unit) {
     var query by remember { mutableStateOf("") }
     var tick by remember { mutableIntStateOf(0) }
@@ -162,42 +194,77 @@ fun MemoryScreen(memory: MemoryStore, onClose: () -> Unit) {
 
         val hits: List<Pair<MemNode, Float>> = remember(query, tick) {
             if (query.isBlank()) {
-                memory.nodes.values.sortedByDescending { it.weight }.take(40).map { it to it.weight }
+                memory.nodes.values.sortedByDescending { it.weight }.take(60).map { it to it.weight }
             } else {
                 memory.retrieve(query, 30)
             }
         }
 
+        var expanded by remember {
+            mutableStateOf(mapOf(
+                MemoryStore.REGION_HIPPO to true,
+                MemoryStore.REGION_NEO to false,
+                MemoryStore.REGION_FLASH to false
+            ))
+        }
+
+        val groups = remember(hits) {
+            listOf(MemoryStore.REGION_HIPPO, MemoryStore.REGION_NEO, MemoryStore.REGION_FLASH)
+                .map { region -> region to hits.filter { it.first.region == region } }
+        }
+
         LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(14.dp)) {
-            items(hits.size) { i ->
-                val (n, score) = hits[i]
-                Column(
-                    Modifier.fillMaxWidth().padding(bottom = 10.dp)
-                        .clip(RoundedCornerShape(Ui.ChipRadius))
-                        .background(Color.White)
-                        .padding(12.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            Modifier.clip(RoundedCornerShape(6.dp))
-                                .background(regionColor(n.region).copy(alpha = 0.15f))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
+            if (query.isBlank()) {
+                groups.forEach { (region, list) ->
+                    item(key = "hdr_" + region) {
+                        val open = expanded[region] == true
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clip(RoundedCornerShape(Ui.ChipRadius))
+                                .background(Color.White)
+                                .tap {
+                                    expanded = expanded + (region to !open)
+                                }
+                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Txt(memory.regionLabel(n.region), size = 10.sp, color = regionColor(n.region))
+                            Box(
+                                Modifier.size(8.dp).clip(CircleShape)
+                                    .background(regionColor(region))
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Txt(memory.regionLabel(region), size = 13.sp, weight = FontWeight.Medium)
+                            Spacer(Modifier.width(6.dp))
+                            Txt("${list.size} 条", size = 11.sp, color = Color(0xFF8A96A8))
+                            Spacer(Modifier.weight(1f))
+                            Txt(if (open) "收起" else "展开", size = 11.sp, color = Ui.AccentDeep)
                         }
-                        Spacer(Modifier.width(8.dp))
-                        Txt("强度 ${n.weight.toInt()}", size = 10.sp, color = Color(0xFF5B6B85))
-                        Spacer(Modifier.width(8.dp))
-                        Txt("惊异 ${"%.2f".format(n.surprise)}", size = 10.sp, color = Color(0xFF5B6B85))
-                        Spacer(Modifier.weight(1f))
-                        Txt("相关 ${"%.2f".format(score)}", size = 10.sp, color = Color(0xFF8A96A8))
                     }
-                    Spacer(Modifier.height(6.dp))
-                    Txt(n.text, size = 14.sp)
+                    if (expanded[region] == true) {
+                        items(list.size, key = { "m_" + list[it].first.id }) { i ->
+                            val (n, score) = list[i]
+                            MemoryCard(memory, n, score)
+                        }
+                        if (list.isEmpty()) {
+                            item(key = "empty_" + region) {
+                                Txt(
+                                    "这个脑区还没有记忆",
+                                    Modifier.padding(start = 12.dp, top = 6.dp, bottom = 4.dp),
+                                    size = 12.sp, color = Color(0xFF8A96A8)
+                                )
+                            }
+                        }
+                    }
+                    item(key = "gap_" + region) { Spacer(Modifier.height(8.dp)) }
                 }
-            }
-            if (hits.isEmpty()) {
-                item { Txt("还没有记忆。先聊几句，系统会自动编码。", size = 13.sp, color = Color(0xFF5B6B85)) }
+            } else {
+                items(hits.size) { i ->
+                    val (n, score) = hits[i]
+                    MemoryCard(memory, n, score)
+                }
+                if (hits.isEmpty()) {
+                    item { Txt("没搜到相关记忆", size = 13.sp, color = Color(0xFF5B6B85)) }
+                }
             }
         }
     }
@@ -216,21 +283,12 @@ private fun ClearConfirmDialog(
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
-    Dialog(onDismissRequest = onDismiss) {
-        Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp))
-                .background(Color.White).padding(20.dp)
-        ) {
-            Txt(title, size = 16.sp, weight = FontWeight.SemiBold)
-            Spacer(Modifier.height(8.dp))
-            Txt(desc, size = 13.sp, color = Color(0xFF5B6B85))
-            Spacer(Modifier.height(18.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Box(Modifier.weight(1f)) { Chip("取消") { onDismiss() } }
-                Box(Modifier.weight(1f)) { Chip("确认清空", danger = true) { onConfirm() } }
-            }
-        }
-    }
+    HoldConfirmOverlay(
+        title = title.removeSuffix("？"),
+        hint = desc,
+        onConfirm = onConfirm,
+        onDismiss = onDismiss
+    )
 }
 
 @Composable
@@ -248,7 +306,8 @@ fun ColumnScope.SettingsScreen(
     onOpenRelation: () -> Unit,
     onClearChat: () -> Unit,
     onClearFeed: () -> Unit,
-    onClearMemory: () -> Unit
+    onClearMemory: () -> Unit,
+    onClearDiary: () -> Unit
 ) {
     var pendingClear by remember { mutableStateOf<String?>(null) }
 
@@ -257,9 +316,13 @@ fun ColumnScope.SettingsScreen(
             .padding(start = 14.dp, end = 14.dp, top = 112.dp, bottom = 120.dp)
     ) {
         Section(backdrop, settings, "接口 API") {
-            Field("接口地址", settings.baseUrl) { onChange(settings.copy(baseUrl = it)) }
-            Field("API Key", settings.apiKey, password = true) {
+            CommitField("接口地址", settings.baseUrl, hint = "https://api.deepseek.com/v1") {
+                onChange(settings.copy(baseUrl = it.trim()))
+                true
+            }
+            CommitField("API Key", settings.apiKey, password = true, hint = "sk-...") {
                 onChange(settings.copy(apiKey = it.trim()))
+                true
             }
             Txt(
                 "当前 Key 长度 ${settings.apiKey.trim().length}（DeepSeek 官方一般 35 位，含 sk-）",
@@ -268,8 +331,10 @@ fun ColumnScope.SettingsScreen(
             Spacer(Modifier.height(8.dp))
             var testMsg by remember { mutableStateOf("") }
             val scope = rememberCoroutineScope()
-            Chip(if (testMsg.isEmpty()) "测试连接" else "再测一次") {
-                scope.launch { testMsg = testConnection(settings) }
+            HoldButton(label = if (testMsg.isEmpty()) "测试连接" else "再测一次") {
+                val result = testConnection(settings)
+                testMsg = result
+                result.contains("正常") || result.contains("成功") || result.contains("✓")
             }
             if (testMsg.isNotEmpty()) {
                 Spacer(Modifier.height(6.dp))
@@ -283,10 +348,14 @@ fun ColumnScope.SettingsScreen(
         }
 
         Section(backdrop, settings, "模型") {
-            Field("模型名", settings.model) { onChange(settings.copy(model = it)) }
+            CommitField("模型名", settings.model, hint = "deepseek-flash") {
+                onChange(settings.copy(model = it.trim()))
+                true
+            }
             Spacer(Modifier.height(4.dp))
-            Field("创作模型（留空=与聊天相同）", settings.creativeModel) {
+            CommitField("创作模型（留空=与聊天相同）", settings.creativeModel, hint = "留空则共用") {
                 onChange(settings.copy(creativeModel = it.trim()))
+                true
             }
             Txt(
                 "留空则与聊天共用。建议聊天用 deepseek-flash，创作填 deepseek-chat。",
@@ -322,6 +391,13 @@ fun ColumnScope.SettingsScreen(
         }
 
         Section(backdrop, settings, "身份") {
+            CommitFieldMulti(
+                "人格", settings.persona, lines = 4,
+                hint = "她是怎样的人、怎么说话"
+            ) {
+                onChange(settings.copy(persona = it))
+                true
+            }
             Field("她的名字", settings.botName) { onChange(settings.copy(botName = it)) }
             Field("你的名字", settings.userName) { onChange(settings.copy(userName = it)) }
             AvatarRow("她的头像", isBot = true, settings = settings, onChange = onChange)
@@ -333,11 +409,12 @@ fun ColumnScope.SettingsScreen(
         }
 
         Section(backdrop, settings, "通用设置") {
-            Field("人格", settings.persona, lines = 4) {
-                onChange(settings.copy(persona = it))
-            }
-            Field("规则", settings.rules, lines = 3) {
+            CommitFieldMulti(
+                "规则", settings.rules, lines = 3,
+                hint = "必须遵守的事，例如不要自称 AI"
+            ) {
                 onChange(settings.copy(rules = it))
+                true
             }
             SwitchRow("显示时间", settings.showTime) {
                 onChange(settings.copy(showTime = it))
@@ -352,20 +429,13 @@ fun ColumnScope.SettingsScreen(
                 onChange(settings.copy(segmentReply = it))
             }
             if (settings.segmentReply) {
-                Spacer(Modifier.height(4.dp))
-                Txt(
-                    "每条间隔 ${"%.1f".format(settings.segmentGap / 1000f)} 秒",
-                    size = 12.sp, color = Color(0xFF5B6B85)
-                )
                 Spacer(Modifier.height(6.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(1500, 2000, 2500, 3000, 4000).forEach { gap ->
-                        Chip(
-                            "${"%.1f".format(gap / 1000f)}s",
-                            danger = settings.segmentGap == gap
-                        ) { onChange(settings.copy(segmentGap = gap)) }
-                    }
-                }
+                LiquidSlider(
+                    value = settings.segmentGap / 1000f,
+                    steps = listOf(1.5f, 2f, 2.5f, 3f, 4f),
+                    onChange = { onChange(settings.copy(segmentGap = (it * 1000).toInt())) },
+                    label = { "%.1f 秒".format(it) }
+                )
             }
             SwitchRow("AI 判断记忆权重", settings.aiMemory) {
                 onChange(settings.copy(aiMemory = it))
@@ -511,6 +581,10 @@ fun ColumnScope.SettingsScreen(
             }
             Spacer(Modifier.height(8.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Chip("清空日记", danger = true) { pendingClear = "diary" }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Chip("清空记忆库", danger = true) { pendingClear = "memory" }
             }
         }
@@ -531,6 +605,7 @@ fun ColumnScope.SettingsScreen(
             val pair: Pair<String, String> = when (what) {
                 "chat" -> "清空全部聊天？" to "聊天记录会全部删除，且无法恢复。记忆和日记不受影响。"
                 "feed" -> "清空全部动态？" to "她发过的动态会全部删除，且无法恢复。"
+                "diary" -> "清空全部日记？" to "所有日记（包括她写的、剧情）都会被删除，且无法恢复。"
                 else -> "清空记忆库？" to "她会忘掉记住的所有事情（脑区、权重、图谱），且无法恢复。聊天记录不受影响。"
             }
             val (title, desc) = pair
@@ -542,6 +617,7 @@ fun ColumnScope.SettingsScreen(
                     when (what) {
                         "chat" -> onClearChat()
                         "feed" -> onClearFeed()
+                        "diary" -> onClearDiary()
                         else -> onClearMemory()
                     }
                     pendingClear = null
@@ -777,7 +853,10 @@ fun AchievementsScreen(stats: Map<String, Int>, onClose: () -> Unit) {
             Spacer(Modifier.weight(1f))
             Txt("成就", size = 16.sp, weight = FontWeight.SemiBold)
             Spacer(Modifier.weight(1f))
-            Txt("$unlocked/${Achievements.all.size}", size = 12.sp, color = Color(0xFF5B6B85))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                RollingNumber(unlocked, size = 12.sp, color = Color(0xFF5B6B85))
+                Txt("/${Achievements.all.size}", size = 12.sp, color = Color(0xFF5B6B85))
+            }
         }
 
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
@@ -787,7 +866,6 @@ fun AchievementsScreen(stats: Map<String, Int>, onClose: () -> Unit) {
                 val done = value >= a.target
                 val ratio = (value.toFloat() / a.target).coerceIn(0f, 1f)
 
-                // 入场：逐条上浮淡入
                 var appeared by remember { mutableStateOf(false) }
                 LaunchedEffect(Unit) {
                     delay(i * 45L)
@@ -811,57 +889,105 @@ fun AchievementsScreen(stats: Map<String, Int>, onClose: () -> Unit) {
                     label = "achIcon"
                 )
 
-                Row(
-                    Modifier.fillMaxWidth().padding(bottom = 10.dp)
+                var flipped by remember(a.id) { mutableStateOf(false) }
+
+                FlipCard(
+                    flipped = flipped,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 10.dp)
                         .graphicsLayer {
                             alpha = enterAlpha
                             translationY = enterY
                         }
                         .clip(RoundedCornerShape(Ui.ChipRadius))
                         .background(Color.White)
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        Modifier.size(40.dp).clip(RoundedCornerShape(12.dp))
-                            .graphicsLayer { scaleX = iconScale; scaleY = iconScale }
-                            .background(
-                                if (done) Color(0xFFE3EFFF) else Color(0xFFF0F2F5)
-                            ),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Txt(a.icon, size = 20.sp)
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Txt(a.title, size = 14.sp, weight = FontWeight.Medium)
-                            Spacer(Modifier.width(6.dp))
-                            if (done) {
-                                Txt("已解锁", size = 10.sp, color = Ui.AccentDeep)
-                            }
-                        }
-                        Spacer(Modifier.height(2.dp))
-                        Txt(a.desc, size = 11.sp, color = Color(0xFF8A96A8))
-                        Spacer(Modifier.height(6.dp))
-                        Box(
-                            Modifier.fillMaxWidth().height(4.dp)
-                                .clip(RoundedCornerShape(2.dp))
-                                .background(Color(0xFFE9EDF2))
+                        .tap { flipped = !flipped },
+                    front = {
+                        Row(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Box(
-                                Modifier.fillMaxWidth(barRatio).height(4.dp)
-                                    .clip(RoundedCornerShape(2.dp))
-                                    .background(if (done) Ui.Accent else Color(0xFFB9CBE5))
+                                Modifier.size(40.dp).clip(RoundedCornerShape(12.dp))
+                                    .graphicsLayer { scaleX = iconScale; scaleY = iconScale }
+                                    .background(
+                                        if (done) Color(0xFFE3EFFF) else Color(0xFFF0F2F5)
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Txt(a.icon, size = 20.sp)
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Txt(a.title, size = 14.sp, weight = FontWeight.Medium)
+                                    if (done) {
+                                        Spacer(Modifier.width(6.dp))
+                                        DrawCheck(visible = appeared, size = 13.dp)
+                                    }
+                                }
+                                Spacer(Modifier.height(2.dp))
+                                Txt(a.desc, size = 11.sp, color = Color(0xFF8A96A8))
+                                Spacer(Modifier.height(6.dp))
+                                Box(
+                                    Modifier.fillMaxWidth().height(4.dp)
+                                        .clip(RoundedCornerShape(2.dp))
+                                        .background(Color(0xFFE9EDF2))
+                                ) {
+                                    Box(
+                                        Modifier.fillMaxWidth(barRatio).height(4.dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                            .background(if (done) Ui.Accent else Color(0xFFB9CBE5))
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            Txt(
+                                "${value.coerceAtMost(a.target)}/${a.target}",
+                                size = 10.sp, color = Color(0xFF8A96A8)
                             )
                         }
+                    },
+                    back = {
+                        Column(Modifier.fillMaxWidth().padding(14.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Txt(a.icon, size = 18.sp)
+                                Spacer(Modifier.width(8.dp))
+                                Txt(a.title, size = 13.sp, weight = FontWeight.SemiBold)
+                                Spacer(Modifier.weight(1f))
+                                Txt(
+                                    if (done) "已达成" else "进行中",
+                                    size = 10.sp,
+                                    color = if (done) Ui.AccentDeep else Color(0xFF8A96A8)
+                                )
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Txt("条件：${a.desc}", size = 11.sp, color = Color(0xFF5B6B85))
+                            Spacer(Modifier.height(8.dp))
+                            Box(
+                                Modifier.fillMaxWidth().height(5.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(Color(0xFFE9EDF2))
+                            ) {
+                                Box(
+                                    Modifier.fillMaxWidth(barRatio).height(5.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(if (done) Ui.Accent else Color(0xFFB9CBE5))
+                                )
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Txt(
+                                    "${value.coerceAtMost(a.target)}/${a.target}",
+                                    size = 10.sp, color = Color(0xFF8A96A8)
+                                )
+                                Spacer(Modifier.weight(1f))
+                                Txt("点击翻回", size = 10.sp, color = Color(0xFFB0BAC9))
+                            }
+                        }
                     }
-                    Spacer(Modifier.width(10.dp))
-                    Txt(
-                        "${value.coerceAtMost(a.target)}/${a.target}",
-                        size = 10.sp, color = Color(0xFF8A96A8)
-                    )
-                }
+                )
             }
         }
     }

@@ -24,6 +24,11 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.slideInVertically
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -35,6 +40,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
@@ -78,6 +89,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.TextUnit
@@ -108,6 +120,9 @@ import java.util.Locale
 
 private const val DEFAULT_BASE = "https://api.deepseek.com/v1"
 private const val DEFAULT_KEY = ""
+private const val MAX_IMAGES = 100
+private const val MAX_BYTES = 150L * 1024 * 1024
+
 private const val DEFAULT_MODEL = "deepseek-flash"
 private const val DEFAULT_PERSONA =
     "你是大肥鱼，也叫小鱼，一只住在电脑里的蓝色鲸鱼娘。对爸爸活泼、亲近，会撒娇也会吐槽。" +
@@ -692,9 +707,16 @@ private fun FeiyuApp() {
     var storyLoading by remember { mutableStateOf(false) }
     var storyOpen by remember { mutableStateOf(false) }
     var achQueue by remember { mutableStateOf<List<Achievement>>(emptyList()) }
-    var swipeDx by remember { mutableFloatStateOf(0f) }
     var gatePassed by remember { mutableStateOf(prefs(ctx).getBoolean("gate_passed", false)) }
     var achTick by remember { mutableIntStateOf(0) }
+    var streamText by remember { mutableStateOf("") }
+    val imeDensity = LocalDensity.current
+    val imeInsets = WindowInsets.ime
+    var imeOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        snapshotFlow { imeInsets.getBottom(imeDensity) > 0 }.collect { imeOpen = it }
+    }
+    val haptic = LocalHapticFeedback.current
     var showMap by remember { mutableStateOf(false) }
     var starCenter by remember { mutableStateOf(Offset.Zero) }
     var lastActive by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -768,7 +790,7 @@ private fun FeiyuApp() {
             }
             if (LocalEmbedder.isReady()) {
                 memory.localEmbed = { text -> LocalEmbedder.embed(text) }
-                runCatching { memory.reembedAll() }
+                // 旧记忆的重算放到设置页手动触发，避免启动时与界面并发读写记忆表
             }
         }
     }
@@ -857,16 +879,30 @@ private fun FeiyuApp() {
         saveMessages(ctx, messages)
     }
 
-    /** 只保留最近 100 张聊天图片，超出的删掉最旧的 */
+    /**
+     * 聊天图片清理：
+     * - 数量上限 100 张
+     * - 总量上限 150MB
+     * 任一超出，从最旧的开始删
+     */
     fun cleanupChatImages() {
         runCatching {
-            val files = ctx.filesDir.listFiles { f -> f.isFile && f.name.startsWith("chat_") } ?: return
-            if (files.size <= 100) return
-            files.sortedBy { it.lastModified() }
-                .take(files.size - 100)
-                .forEach { it.delete() }
+            val files = ctx.filesDir.listFiles { f -> f.isFile && f.name.startsWith("chat_") }
+                ?: return
+            val sorted = files.sortedBy { it.lastModified() }
+            var total = sorted.sumOf { it.length() }
+            val overCount = (sorted.size - MAX_IMAGES).coerceAtLeast(0)
+            var removed = 0
+            for (f in sorted) {
+                if (removed >= overCount && total <= MAX_BYTES) break
+                total -= f.length()
+                f.delete()
+                removed++
+            }
         }
     }
+
+
 
     fun sendImage(path: String) {
         if (path.isBlank()) return
@@ -997,27 +1033,36 @@ private fun FeiyuApp() {
                 val reply = if (settings.stream) {
                     val base = messages
                     val ts = System.currentTimeMillis()
-                    push(Msg("…", false, ts))
                     var lastComplete = 0
-                    var shown = "…"
+                    var shown = ""
+                    var lastUi = 0L
                     try {
                         val full = streamModel(settings, history, text, extraSystem = extra) { partial ->
                             val parts = if (settings.aiSegment) partial.split("|||") else listOf(partial)
                             val complete = parts.dropLast(1).map { it.trim() }.filter { it.isNotEmpty() }
-                            if (complete.size > lastComplete) {
-                                lastComplete = complete.size
-                                delay(
-                                    (settings.segmentGap * kotlin.random.Random.nextDouble(0.85, 1.2)).toLong()
-                                )
-                            }
-                            val cur = parts.last().trimStart().ifBlank { "…" }
+                            val cur = parts.last().trimStart()
                             shown = cur
 
-                            val list = ArrayList<Msg>(base.size + complete.size + 1)
-                            list.addAll(base)
-                            complete.forEachIndexed { i, t -> list.add(Msg(t, false, ts + i)) }
-                            list.add(Msg(cur, false, ts + complete.size))
-                            messages = list
+                            // 只有「完整段」变化时才重建消息列表
+                            if (complete.size != lastComplete) {
+                                if (complete.size > lastComplete) {
+                                    delay(
+                                        (settings.segmentGap * kotlin.random.Random.nextDouble(0.85, 1.2)).toLong()
+                                    )
+                                }
+                                lastComplete = complete.size
+                                val list = ArrayList<Msg>(base.size + complete.size)
+                                list.addAll(base)
+                                complete.forEachIndexed { i, t -> list.add(Msg(t, false, ts + i)) }
+                                messages = list
+                            }
+
+                            // 增长中的那一段走独立状态，节流到 ~14fps，避免每 token 重排整页
+                            val now = System.currentTimeMillis()
+                            if (now - lastUi > 70) {
+                                lastUi = now
+                                streamText = cur
+                            }
                         }
 
                         val parts = if (settings.aiSegment) full.split("|||") else listOf(full)
@@ -1033,10 +1078,12 @@ private fun FeiyuApp() {
                             finalList.add(Msg(shown, false, ts))
                         }
                         messages = finalList
+                        streamText = ""
                         saveMessages(ctx, finalList)
                         full
                     } catch (e: Exception) {
                         messages = base
+                        streamText = ""
                         saveMessages(ctx, base)
                         throw e
                     }
@@ -1162,10 +1209,6 @@ private fun FeiyuApp() {
         }
     }
 
-    LaunchedEffect(messages.size) {
-        if (tab == 0 && messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
-    }
-
     if (!gatePassed) {
         GateScreen {
             prefs(ctx).edit().putBoolean("gate_passed", true).apply()
@@ -1188,10 +1231,13 @@ private fun FeiyuApp() {
                     bitmap = wallBmp.asImageBitmap(),
                     contentDescription = null,
                     modifier = Modifier.fillMaxSize().graphicsLayer {
-                        scaleX = settings.wallScale
-                        scaleY = settings.wallScale
+                        // 轻微视差：随聊天滚动上下浮动，看起来壁纸在"呼吸"
+                        val parallax = (listState.firstVisibleItemScrollOffset % 1200) * 0.05f
+                        val s = settings.wallScale * 1.035f
+                        scaleX = s
+                        scaleY = s
                         translationX = settings.wallOffX * size.width
-                        translationY = settings.wallOffY * size.height
+                        translationY = settings.wallOffY * size.height - parallax
                     },
                     contentScale = ContentScale.Crop
                 )
@@ -1232,7 +1278,40 @@ private fun FeiyuApp() {
             }
         }
 
-        Box(Modifier.fillMaxSize().imePadding()) {
+        Box(
+            Modifier.fillMaxSize().imePadding()
+                // 全局左右滑动切页：用 Initial 阶段监听，不抢子控件的事件
+                .pointerInput(tab) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(
+                            requireUnconsumed = false,
+                            pass = PointerEventPass.Initial
+                        )
+                        var totalX = 0f
+                        var totalY = 0f
+                        var horizontal = false
+                        var decided = false
+
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) {
+                                if (horizontal && kotlin.math.abs(totalX) > 90f) {
+                                    if (totalX < 0 && tab < 3) tab += 1
+                                    else if (totalX > 0 && tab > 0) tab -= 1
+                                }
+                                break
+                            }
+                            totalX += change.positionChange().x
+                            totalY += change.positionChange().y
+                            if (!decided && (kotlin.math.abs(totalX) > 20f || kotlin.math.abs(totalY) > 20f)) {
+                                decided = true
+                                horizontal = kotlin.math.abs(totalX) > kotlin.math.abs(totalY)
+                            }
+                        }
+                    }
+                }
+        ) {
             Column(Modifier.fillMaxSize()) {
 var lastTab by remember { mutableIntStateOf(tab) }
             var tabDir by remember { mutableIntStateOf(1) }
@@ -1279,27 +1358,13 @@ var lastTab by remember { mutableIntStateOf(tab) }
                 Modifier.weight(1f).fillMaxWidth().layerBackdrop(contentBackdrop).graphicsLayer {
                     alpha = 0.55f + 0.45f * tabAnim.value
                     translationX = (1f - tabAnim.value) * 44f * tabDir
-                }.pointerInput(tab) {
-                    detectHorizontalDragGestures(
-                        onDragStart = { swipeDx = 0f },
-                        onHorizontalDrag = { _, drag ->
-                            swipeDx += drag
-                        },
-                        onDragEnd = {
-                            val d = swipeDx
-                            swipeDx = 0f
-                            when {
-                                d < -110f && tab < 3 -> tab += 1
-                                d > 110f && tab > 0 -> tab -= 1
-                            }
-                        }
-                    )
                 }
             ) {
                 Column(Modifier.fillMaxSize()) {
                                 when (tab) {
                                     0 -> ChatScreen(
                                         backdrop, settings, messages, listState, busy, error,
+                                        streamingText = streamText,
                                         onSend = { send(it) },
                     onSendImage = { sendImage(it) }
                                     )
@@ -1340,6 +1405,9 @@ var lastTab by remember { mutableIntStateOf(tab) }
                                         onClearFeed = {
                                             feed = emptyList(); saveFeed(ctx, feed)
                                         },
+                                        onClearDiary = {
+                                            diary = emptyList(); saveDiary(ctx, diary)
+                                        },
                                         onClearMemory = {
                                             memory.clear()
                                             android.widget.Toast.makeText(
@@ -1377,7 +1445,20 @@ Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
                     ) {
                         ChatAvatar(isBot = true, settings = settings)
                         Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
+                        Column(
+                            Modifier.weight(1f).pointerInput(tab) {
+                                detectTapGestures(
+                                    onDoubleTap = {
+                                        haptic.performHapticFeedback(
+                                            androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove
+                                        )
+                                        scope.launch {
+                                            runCatching { listState.animateScrollToItem(0) }
+                                        }
+                                    }
+                                )
+                            }
+                        ) {
                             Txt(settings.botName.ifBlank { "WhaleChat" }, size = 16.sp, weight = FontWeight.SemiBold)
                             androidx.compose.animation.AnimatedVisibility(
                                 visible = busy,
@@ -1506,14 +1587,6 @@ Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
             }
         }
 
-        achQueue.firstOrNull()?.let { a ->
-            key(a.id) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopStart) {
-                    AchievementToast(a) { achQueue = achQueue.drop(1) }
-                }
-            }
-        }
-
         if (storyOpen) {
             StoryScreen(
                 chapter = "第 ${storyChapter} 章",
@@ -1530,7 +1603,8 @@ Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
             )
         }
 
-        if (showRelation) {
+
+        SecondaryPage(visible = showRelation, onClose = { showRelation = false }) {
             RelationshipScreen(
                 ctx = ctx,
                 messages = messages.size,
@@ -1540,18 +1614,18 @@ Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
             )
         }
 
-        if (showAchieve) {
+        SecondaryPage(visible = showAchieve, onClose = { showAchieve = false }) {
             AchievementsScreen(
                 stats = Achievements.stats(ctx, messages.size, memory.size, diary.size, feed.size),
                 onClose = { showAchieve = false }
             )
         }
 
-        if (showLog) {
+        SecondaryPage(visible = showLog, onClose = { showLog = false }) {
             LogScreen(onClose = { showLog = false })
         }
 
-        if (showMemory) {
+        SecondaryPage(visible = showMemory, onClose = { showMemory = false }) {
             MemoryScreen(
                 memory = memory,
                 onClose = { showMemory = false }
@@ -1580,6 +1654,16 @@ Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
                     cropBitmap = null
                 }
             )
+        }
+
+        // 成就弹窗：等所有二级页关闭后再弹，避免被挡住或打断阅读
+        val pageOpen = showMemory || showAchieve || showRelation || showLog || storyOpen || cropBitmap != null
+        if (!pageOpen) achQueue.firstOrNull()?.let { a ->
+            key(a.id) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopStart) {
+                    AchievementToast(a) { achQueue = achQueue.drop(1) }
+                }
+            }
         }
     }
 }
@@ -1717,62 +1801,75 @@ private fun ColumnScope.FeedScreen(
     error: String,
     onGenerate: () -> Unit
 ) {
-    LazyColumn(
-        modifier = Modifier.weight(1f).fillMaxWidth(),
-        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 112.dp, bottom = 120.dp)
-    ) {
-        item {
-            GlassBox(backdrop, RoundedCornerShape(18.dp), Modifier.fillMaxWidth(), settings.glass) {
-                Row(
-                    Modifier.fillMaxWidth().padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Txt("她的动态", weight = FontWeight.SemiBold)
-                    Spacer(Modifier.weight(1f))
-                    Txt(
-                        if (busy) "写着…" else "让她写一条",
-                        size = 13.sp, color = Color(0xFF2F7FE0),
-                        modifier = Modifier.tap(onGenerate)
-                    )
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-        }
-        items(feed.size) { i ->
-            val p = feed[i]
-            GlassBox(backdrop, RoundedCornerShape(18.dp), Modifier.fillMaxWidth().animateIn(p.ts), settings.glass) {
-                Column(Modifier.padding(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            Modifier.clip(RoundedCornerShape(6.dp))
-                                .background(Ui.Accent.copy(alpha = 0.14f))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        ) {
-                            Txt("动态", size = 10.sp, color = Ui.AccentDeep)
-                        }
+
+    Box(Modifier.weight(1f).fillMaxWidth()) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 112.dp, bottom = 120.dp)
+        ) {
+            item {
+                GlassBox(backdrop, RoundedCornerShape(18.dp), Modifier.fillMaxWidth(), settings.glass) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Txt("她的动态", weight = FontWeight.SemiBold)
                         Spacer(Modifier.weight(1f))
                         Txt(
-                            SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(p.ts)),
-                            size = 10.sp, color = Color(0xFF8A96A8)
+                            if (busy) "写着…" else "让她写一条",
+                            size = 13.sp, color = Color(0xFF2F7FE0),
+                            modifier = Modifier.tap(onGenerate)
                         )
                     }
-                    Spacer(Modifier.height(8.dp))
-                    Txt(p.text, size = 15.sp)
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            if (busy && feed.isEmpty()) {
+                item { FeedSkeleton(backdrop, settings.glass) }
+            }
+
+            items(feed.size) { idx ->
+                val p = feed[idx]
+                GlassBox(
+                    backdrop,
+                    RoundedCornerShape(18.dp),
+                    Modifier.fillMaxWidth()
+                        .animateIn(p.ts),
+                    settings.glass
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                Modifier.clip(RoundedCornerShape(6.dp))
+                                    .background(Ui.Accent.copy(alpha = 0.14f))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Txt("动态", size = 10.sp, color = Ui.AccentDeep)
+                            }
+                            Spacer(Modifier.weight(1f))
+                            Txt(
+                                SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(p.ts)),
+                                size = 10.sp, color = Color(0xFF8A96A8)
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Txt(p.text, size = 15.sp)
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            if (feed.isEmpty() && !busy) {
+                item {
+                    Box(
+                        Modifier.fillMaxWidth().padding(top = 60.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Txt("还没有动态，点上面让她写一条", size = 13.sp, color = Color(0xFF5B6B85))
+                    }
                 }
             }
-            Spacer(Modifier.height(12.dp))
-        }
-        if (feed.isEmpty()) {
-            item {
-                Txt(
-                    "还没有动态，点上面让她写一条",
-                    Modifier.fillMaxWidth().padding(top = 60.dp),
-                    size = 13.sp, color = Color(0xFF5B6B85)
-                )
-            }
-        }
-        if (error.isNotEmpty()) {
-            item { Txt(error, size = 12.sp, color = Color(0xFFD14343)) }
         }
     }
 }
